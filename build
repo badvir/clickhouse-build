@@ -1,0 +1,205 @@
+#!/bin/bash
+
+RELEASE_NAME="2.secui"
+VERSION="latest"
+
+make_artifacts() {
+    rm -rf artifacts
+    mkdir -p artifacts
+    mv rpmbuild/RPMS/x86_64/*.rpm artifacts
+    return $?
+}
+
+pre_build()
+{
+    #clean up
+    rm -rf rpmbuild
+
+    echo "change creation function(user/group)"
+    /bin/cp -f ../clickhouse.spec.funcs.sh src/clickhouse.spec.funcs.sh
+
+    # make a spec file
+    ./builder build --spec
+
+
+    # replace release name
+    cat rpmbuild/SPECS/clickhouse.spec | sed -e "s|Release: 1%{?dist}|Release: $RELEASE_NAME|" > rpmbuild/SPECS/clickhouse.spec.tmp
+    mv rpmbuild/SPECS/clickhouse.spec.tmp rpmbuild/SPECS/clickhouse.spec
+
+    # set a no debug package
+    #sed -i '1s/^/%global debug_package %{nil}\n/' rpmbuild/SPECS/clickhouse.spec
+
+    # add Requires
+    sed '/Summary: \%{name} client binary/a Requires(post):     shadow-utils' rpmbuild/SPECS/clickhouse.spec > rpmbuild/SPECS/clickhouse.spec.tmp
+    mv rpmbuild/SPECS/clickhouse.spec.tmp rpmbuild/SPECS/clickhouse.spec
+    sed '/Summary: Server files for \%{name}/a Requires(post):     shadow-utils' rpmbuild/SPECS/clickhouse.spec > rpmbuild/SPECS/clickhouse.spec.tmp
+    mv rpmbuild/SPECS/clickhouse.spec.tmp rpmbuild/SPECS/clickhouse.spec
+
+}
+
+
+
+build()
+{
+    # make a rpm
+    ./builder build --rpms --from-archive --debuginfo=no
+
+}
+
+
+post_build()
+{
+    make_artifacts
+    if [ $? != 0 ]; then echo "FAIL:make_artifacts"; exit 1; fi
+
+    # check rpms
+    ../build_check_rpm.sh
+}
+
+
+build_local()
+{
+    if [ $# -ne 1 ]
+    then
+        echo "need 1 parameter(version)"
+        exit 1
+    fi
+
+    #check directory 
+    if [ ! -d $1 ]; then
+        echo "$1 does not exist"
+        exit 1
+    fi
+
+    echo "build - local"
+    cd $1 
+    pwd
+    
+    build
+
+    post_build
+}
+
+
+# builder 스크립트를 우리의 환경에 맞게 업데이트한다.
+change_builder_script()
+{
+    #builder - change make tools
+    sed 's/echo \"CMAKE=$CMAKE\"/export CMAKE=cmake;export CC=gcc;export CXX=g++;echo \"CMAKE=$CMAKE\"/g' builder > builder.tmp
+    mv builder.tmp builder
+
+
+    #buider - add sorce path
+    sed '/git submodule update --init --recursive/a ret=$(../../../../build_patch_source.sh); if [ $? -ne 0 ]; then echo "fail: $ret"; exit 1; else echo "success"; fi ' builder > builder.tmp
+    #sed '/git submodule update --init --recursive/a patch -p1 < ../../../../clickhouse_src_patch/* ' builder > builder.tmp
+    mv builder.tmp builder
+
+    if [ "$VERSION" != "lastest" ]
+    then
+       cat builder | sed  's/CH_VERSION="${CH_VERSION:-[^a-z]*/CH_VERSION="${CH_VERSION:-'"$VERSION"'}"/g' > builder.tmp
+       mv builder.tmp builder
+
+       cat builder | sed  's/CH_TAG="${CH_TAG:-lts}"/CH_TAG="${CH_TAG:-'"$TAG"'}"/g' > builder.tmp
+       mv builder.tmp builder
+
+    fi
+
+    chmod 755 builder
+
+}
+
+
+build_from_git()
+{
+
+    if [ $# -ne 2 ]
+    then
+        echo "need 2 parameter(version, tag:tls, stable, testing)"
+        exit 1
+    fi
+
+    if [ "$1" == "" ]
+    then
+        echo "build - lastest version from github"
+    else
+        VERSION=$1
+    fi
+   
+    if [ "$2" == "" ]
+    then
+        TAG="tls"
+    else
+        TAG=$2
+    fi
+
+    #check directory
+    if [ -d $1 ]; then
+        echo "$1 directory exist."
+        exit 1
+    fi
+
+    
+    echo "build - $VERSION-$TAG from github"
+
+
+    # download rpm package for clickhouse
+    git clone https://github.com/Altinity/clickhouse-rpm.git $1
+    cd $1
+
+    # update git
+    git pull   
+
+
+    change_builder_script
+
+    pre_build
+
+    # download a clickhouse source file
+    ./builder src --download
+
+    # zip source file
+    SOURCE_FILE="ClickHouse-$VERSION-$TAG"
+    ZIP_SOURCE_FILE="$SOURCE_FILE.zip"
+
+    echo "zip file : $ZIP_SOURCE_FILE"
+
+    cd rpmbuild/SOURCES
+    zip -r $ZIP_SOURCE_FILE $SOURCE_FILE
+    cd -
+
+    # build
+    build
+
+    #post build 
+    post_build
+
+}
+
+
+usage="$(basename "$0") [-h] [-g version tag] [-l version] -- program to build the clickhouse-server
+
+where:
+    -h  show this help text
+    -g  download the source code from github and build it
+        > version : download version
+        > tag : tls, stable, testing
+    -l  build from localhost
+        > version : target version
+"
+ 
+
+case "$1" in
+  -h) echo "$usage"
+      exit
+      ;;
+  -g) build_from_git $2 $3
+      exit
+      ;;
+  -l) build_local $2
+      exit
+      ;;
+  *) echo "$usage"
+     exit
+     ;;
+esac
+
